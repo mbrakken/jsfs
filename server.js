@@ -575,11 +575,17 @@ http.createServer(function(req, res){
             idx++;
             read_stream.removeListener("end", on_end);
             read_stream.removeListener("error", on_error);
-            res.setMaxListeners(res.getMaxListeners() - 1);
+            if (res.getMaxListeners !== undefined) {
+              res.setMaxListeners(res.getMaxListeners() - 1);
+            }
             send_blocks();
           }
 
-          res.setMaxListeners(res.getMaxListeners() + 1);
+          if (res.getMaxListeners !== undefined) {
+            res.setMaxListeners(res.getMaxListeners() + 1);
+          } else {
+            res.setMaxListeners(0);
+          }
           read_stream.on("end", on_end);
           read_stream.on("error", on_error);
           read_stream.pipe(unzipper).pipe(decryptor).pipe(res, {end: should_end});
