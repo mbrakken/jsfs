@@ -140,6 +140,8 @@ describe("utils.js", function() {
 
         utils.save_inode(inode, function(found_inode){
           expect(found_inode).to.deep.equal(inode);
+
+          // maybe should do manual inspection of each directory
           utils.load_inode(path, function(err, response){
             expect(err).to.be.null;
             expect(response).to.be.an("object");
