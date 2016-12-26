@@ -1,5 +1,5 @@
-// "use strict";
-/* globals require, Buffer */
+"use strict";
+/* globals require */
 
 /// jsfs - Javascript filesystem with a REST interface
 
@@ -7,432 +7,27 @@
 // strings are double-quoted, variables use underscores, constants are ALL CAPS
 
 // *** UTILITIES  & MODULES ***
-var http    = require("http");
-var crypto  = require("crypto");
-var fs      = require("fs");
-var zlib    = require("zlib");
-var config  = require("./config.js");
-var log     = require("./jlog.js");
-var url     = require("url");
-var through = require("through");
-
-/**
-
-  Lookup WAVE format by chunk size.
-  Chunk size of 16 === PCM (1)
-
-  Chunk size of 40 === WAVE_FORMAT_EXTENSIBLE (65534)
-    The WAVE_FORMAT_EXTENSIBLE format should be used whenever:
-      PCM data has more than 16 bits/sample.
-      The number of channels is more than 2.
-      The actual number of bits/sample is not equal to the container size.
-      The mapping from channels to speakers needs to be specified.
-    We should probably do more finer-grained analysis of this format for determining duration,
-    by examining any fact chunk between the fmt chunk and the data,but this should be enough for
-    current use cases.
-
-  Chunk size of 18 === non-PCM (3, 6, or 7)
-    This could be IEEE float (3), 8-bit ITU-T G.711 A-law (6), 8-bit ITU-T G.711 µ-law (7),
-    all of which probably require different calculations for duration and are not implemented
-
-  Further reading: http://www-mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
-
- */
-
-var WAVE_FMTS = {
-	16 : 1,
-	40 : 65534
-};
-
-// global to keep track of storage location rotation
-var next_storage_location = 0;
-
-// save inode to disk
-function save_inode(inode){
-
-  // store a copy of each inode in each storage location for redundancy
-  for(var storage_location in config.STORAGE_LOCATIONS){
-    var selected_location = config.STORAGE_LOCATIONS[storage_location];
-    fs.writeFile(selected_location.path + inode.fingerprint + ".json", JSON.stringify(inode), function(error){
-      if(error){
-        log.message(log.ERROR, "Error saving inode: " + error);
-      } else {
-        log.message(log.INFO, "Inode saved to disk");
-      }
-    });
-  }
-}
-
-// load inode from disk
-function load_inode(url){
-  var inode = null;
-  log.message(log.DEBUG, "url: " + url);
-
-  // calculate fingerprint
-  var shasum = crypto.createHash("sha1");
-  shasum.update(url);
-  var inode_fingerprint =  shasum.digest("hex");
-
-  // load inode, try each storage location if something goes wrong
-  for(var storage_location in config.STORAGE_LOCATIONS){
-    var selected_location = config.STORAGE_LOCATIONS[storage_location];
-    try{
-      log.message(log.DEBUG, "Loading inode from " + selected_location.path);
-      inode = (JSON.parse(fs.readFileSync(selected_location.path + inode_fingerprint + ".json")));
-      log.message(log.INFO, "Inode loaded from " + selected_location.path);
-      break;
-    } catch(ex) {
-      log.message(log.DEBUG, "Error loading inode from " + selected_location.path);
-    }
-  }
-
-  if(!inode){
-    log.message(log.WARN, "Unable to load inode for requested URL: " + url);
-  }
-
-  return inode;
-}
-
-// simple encrypt-decrypt functions
-function encrypt(block, key){
-  var cipher = crypto.createCipher("aes-256-cbc", key);
-  cipher.write(block);
-  cipher.end();
-  return cipher.read();
-}
-
-// examine the contents of a block to generate metadata
-function analyze_block(block){
-  var result = {};
-  result.type = "unknown";
-  try{
-
-    if(block.toString("utf8", 0, 4) === "RIFF" &&
-      block.toString("utf8", 8, 12) === "WAVE" &&
-      WAVE_FMTS[block.readUInt32LE(16)] == block.readUInt16LE(20)){
-      result.type = "wave";
-      result.size = block.readUInt32LE(4);
-      result.channels = block.readUInt16LE(22);
-      result.bitrate = block.readUInt32LE(24);
-      result.resolution = block.readUInt16LE(34);
-      result.duration = ((((result.size * 8) / result.channels) / result.resolution) / result.bitrate);
-
-      var subchunk_byte = 36;
-      var subchunk_id   = block.toString("utf8", subchunk_byte, subchunk_byte+4);
-      var block_length  = block.length;
-
-      while (subchunk_id !== 'data' && subchunk_byte < block_length) {
-        // update start byte for subchunk by adding
-        // the size of the subchunk + 8 for the id and size bytes (4 each)
-        subchunk_byte = subchunk_byte + block.readUInt32LE(subchunk_byte+4) + 8;
-        subchunk_id = block.toString("utf8", subchunk_byte, subchunk_byte+4);
-      }
-
-      var subchunk_size = block.readUInt32LE(subchunk_byte+4);
-
-      result.subchunk_id     = subchunk_id;
-      result.subchunk_byte   = subchunk_byte;
-      result.data_block_size = block.readUInt16LE(32);
-
-      var audio_data_size = subchunk_id === 'data' ? subchunk_size : result.size;
-      result.duration = (audio_data_size * 8) / (result.channels * result.resolution * result.bitrate);
-    }
-
-    // TODO: test for MP3
-    // TODO: test for FLAC
-    // TODO: test for AIFF
-    // TODO: test for ...
-  } catch(ex) {
-    log.message(log.WARN, "Exception analyzing media type: " + ex);
-  }
-  return result;
-}
-
-function commit_block_to_disk(block, block_object, callback){
-
-  // if storage locations exist, save the block to disk
-  if(config.STORAGE_LOCATIONS.length > 0){
-
-    // check all storage locations to see if we already have this block
-    var found_block_count = 0;
-    for(var storage_location in config.STORAGE_LOCATIONS){
-      var selected_location = config.STORAGE_LOCATIONS[storage_location];
-
-      // check if block exists
-      var block_file_stats;
-      try{
-        // look for compressed blocks first
-        block_file_stats = fs.statSync(selected_location.path + block_object.block_hash + ".gz");
-        found_block_count++;
-        block_object.last_seen = selected_location.path;
-        log.message(log.INFO, "Duplicate compressed block " + block_object.block_hash + " found in " + selected_location.path);
-      } catch(ex) {
-        try{
-          block_file_stats = fs.statSync(selected_location.path + block_object.block_hash);
-          found_block_count++;
-          block_object.last_seen = selected_location.path;
-          log.message(log.INFO, "Duplicate block " + block_object.block_hash + " found in " + selected_location.path);
-        } catch(ex) {
-          //log.message(log.INFO, "Block " + block_object.block_hash + " not found in " + selected_location.path);
-        }
-      }
-    }
-
-    // TODO: consider increasing found count to enable block redundancy
-    if(found_block_count < 1){
-
-      // write new block to next storage location
-      // TODO: consider implementing in-band compression here
-      var dir = config.STORAGE_LOCATIONS[next_storage_location].path;
-      fs.writeFile(dir + block_object.block_hash, block, "binary", function(err){
-        if (err) {
-          return callback(err);
-        }
-
-        block_object.last_seen = dir;
-        log.message(log.INFO, "New block " + block_object.block_hash + " written to " + dir);
-
-        // increment (or reset) storage location (striping)
-        next_storage_location++;
-        if(next_storage_location === config.STORAGE_LOCATIONS.length){
-          next_storage_location = 0;
-        }
-
-        return callback(null, block_object);
-
-      });
-
-    } else {
-      log.message(log.INFO, "Duplicate block " + block_object.block_hash + " not written to disk");
-      return callback(null, block_object);
-    }
-  } else {
-    log.message(log.WARN, "No storage locations configured, block not written to disk");
-    return callback(null, block_object);
-  }
-}
-
-function token_valid(access_token, inode, method){
-
-  // don't bother validating tokens for HEAD, OPTIONS requests
-  // jjg - 08172015: might make sense to address this by removing the check from
-  // the method handlers below, but since I'm not sure if this is
-  // permanent, this is cleaner for now
-  if(method === "HEAD" || method === "OPTIONS"){
-    return true;
-  }
-
-  // generate expected token
-  var shasum = crypto.createHash("sha1");
-  shasum.update(inode.access_key + method);
-  var expected_token = shasum.digest("hex");
-
-  log.message(log.DEBUG,"expected_token: " + expected_token);
-  log.message(log.DEBUG,"access_token: " + access_token);
-
-  // compare
-  if(expected_token === access_token){
-    return true;
-  } else {
-    return false;
-  }
-}
-
-function time_token_valid(access_token, inode, expires, method){
-
-  // don't bother validating tokens for HEAD, OPTIONS requests
-  if(method === "HEAD" || method === "OPTIONS"){
-    return true;
-  }
-
-  // make sure requested time is still valid
-  if(expires < (new Date()).getTime()){
-    log.message(log.WARN,"expires is in the past");
-    return false;
-  } else {
-
-    // make sure token is valid
-    // generate expected token
-    var shasum = crypto.createHash("sha1");
-    shasum.update(inode.access_key + method + expires);
-    var expected_token = shasum.digest("hex");
-
-    log.message(log.DEBUG,"expected_token: " + expected_token);
-    log.message(log.DEBUG,"access_token: " + access_token);
-
-    // compare
-    if(expected_token === access_token){
-      return true;
-    } else {
-      return false;
-    }
-  }
-}
+var http       = require("http");
+var crypto     = require("crypto");
+var zlib       = require("zlib");
+var url        = require("url");
+var through    = require("through");
+var config     = require("./config.js");
+var log        = require("./jlog.js");
+var utils      = require("./lib/utils.js");
+var validate   = require("./lib/validate.js");
+var operations = require("./lib/" + (config.CONFIGURED_STORAGE || "fs") + "/disk-operations.js");
 
 // base storage object
-var Inode = {
-  init: function(url){
-    this.input_buffer = new Buffer("");
-    this.block_size = config.BLOCK_SIZE;
-    this.file_metadata = {};
-    this.file_metadata.url = url;
-    this.file_metadata.created = (new Date()).getTime();
-    this.file_metadata.version = 0;
-    this.file_metadata.private = false;
-    this.file_metadata.encrypted = false;
-    this.file_metadata.fingerprint = null;
-    this.file_metadata.access_key = null;
-    this.file_metadata.content_type = "application/octet-stream";
-    this.file_metadata.file_size = 0;
-    this.file_metadata.block_size = this.block_size;
-    this.file_metadata.blocks_replicated = 0;
-    this.file_metadata.inode_replicated = 0;
-    this.file_metadata.blocks = [];
+var Inode = require("./lib/inode.js");
 
-    // create fingerprint to uniquely identify this file
-    var shasum = crypto.createHash("sha1");
-    shasum.update(this.file_metadata.url);
-    this.file_metadata.fingerprint =  shasum.digest("hex");
+// get this now, rather than at several other points
+var TOTAL_LOCATIONS = config.STORAGE_LOCATIONS.length;
 
-    // use fingerprint as default key
-    this.file_metadata.access_key = this.file_metadata.fingerprint;
-  },
-  write: function(chunk, req, callback){
-    this.input_buffer = new Buffer.concat([this.input_buffer, chunk]);
-    if (this.input_buffer.length > this.block_size) {
-      req.pause();
-      this.process_buffer(false, function(result){
-        req.resume();
-        callback(result);
-      });
-    } else {
-      callback(true);
-    }
-  },
-  close: function(callback){
-    var self = this;
-    log.message(0, "flushing remaining buffer");
-    // update original file size
-    self.file_metadata.file_size = self.file_metadata.file_size + self.input_buffer.length;
-
-    self.process_buffer(true, function(result){
-      if(result){
-        // write  inode to disk
-        save_inode(self.file_metadata);
-        callback(self.file_metadata);
-      }
-    });
-  },
-  process_buffer: function(flush, callback){
-    var self = this;
-    var total = flush ? 0 : self.block_size;
-    this.store_block(!flush, function(err, result){
-      if (err) {
-        log.message(log.DEBUG, "process_buffer result: " + err);
-        return callback(false);
-      }
-
-      if (self.input_buffer.length > total) {
-        self.process_buffer(flush, callback);
-      } else {
-        callback(true);
-      }
-
-    });
-  },
-  store_block: function(update_file_size, callback){
-    var self = this;
-    var chunk_size = this.block_size;
-
-    // grab the next block
-    var block = this.input_buffer.slice(0, chunk_size);
-    if(this.file_metadata.blocks.length === 0){
-
-      // grok known file types
-      var analysis_result = analyze_block(block);
-
-      log.message(log.INFO, "block analysis result: " + JSON.stringify(analysis_result));
-
-      // if we found out anything useful, annotate the object's metadata
-      this.file_metadata.media_type = analysis_result.type;
-      if(analysis_result.type != "unknown"){
-        this.file_metadata.media_size = analysis_result.size;
-        this.file_metadata.media_channels = analysis_result.channels;
-        this.file_metadata.media_bitrate = analysis_result.bitrate;
-        this.file_metadata.media_resolution = analysis_result.resolution;
-        this.file_metadata.media_duration = analysis_result.duration;
-      }
-
-      if (analysis_result.type === 'wave') {
-        // use analyze_block to identify offset until non-zero data, grab just that portion to store
-        // assuming analysis_result.subchunk_2_id === 'data', we'll start the scan at block.readUInt32LE(44)
-        // and if it's not 'data', we'll skip the entire operation
-
-        var b_size = analysis_result.data_block_size;
-
-        if (analysis_result.subchunk_id === 'data' && b_size === 4) {
-          // unlikely not to be 4, but it'd be nice to handle alternate cases
-          // essentially, (b_size * 8) will be the readUInt_x_LE function we use, eg readUInt32LE
-
-          // start of the data, beginning of the subchunk + 8 bytes (4 for label, 4 for size)
-          var data_offset = analysis_result.subchunk_byte + 8;
-          var b_length = block.length;
-
-          // we'll incrememt our offset by the byte size, since we're analyzing on the basis of it
-          for (data_offset; (data_offset + b_size) < b_length; data_offset = data_offset + b_size) {
-            if (block.readUInt32LE(data_offset) !== 0) {
-              log.message(log.INFO, "Storing the first " + data_offset + " bytes seperately");
-              // reduce block to the offset
-              block = block.slice(0, data_offset);
-              chunk_size = data_offset;
-              break;
-            }
-          }
-        }
-      }
-    }
-
-    // if encryption is set, encrypt using the hash above
-    if(this.file_metadata.encrypted && this.file_metadata.access_key){
-      log.message(log.INFO, "encrypting block");
-      block = encrypt(block, this.file_metadata.access_key);
-    } else {
-
-      // if even one block can't be encrypted, say so and stop trying
-      this.file_metadata.encrypted = false;
-    }
-
-    // generate a hash of the block to use as a handle/filename
-    var block_hash = null;
-    var shasum = crypto.createHash("sha1");
-    shasum.update(block);
-    block_hash = shasum.digest("hex");
-
-    // store the block
-    var block_object = {};
-    block_object.block_hash = block_hash;
-    commit_block_to_disk(block, block_object, function(err, result){
-      if (err) {
-        return callback(err);
-      }
-
-      // update inode
-      self.file_metadata.blocks.push(result);
-
-      // update original file size
-      // we need to update filesize here due to truncation at the front,
-      // but need the check to avoid double setting during flush
-      // is there a better way?
-      if (update_file_size) {
-        self.file_metadata.file_size = self.file_metadata.file_size + chunk_size;
-      }
-
-      // advance buffer
-      self.input_buffer = self.input_buffer.slice(chunk_size);
-      return callback(null, result);
-    });
-  }
-};
+// all responses include these headers to support cross-domain requests
+var ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS"];
+var ALLOWED_HEADERS = ["Accept", "Accept-Version", "Content-Type", "Api-Version", "Origin", "X-Requested-With","Range","X_FILENAME","X-Access-Key","X-Replacement-Access-Key","X-Access-Token", "X-Encrypted", "X-Private", "X-Append"];
+var EXPOSED_HEADERS = ["X-Media-Type", "X-Media-Size", "X-Media-Channels", "X-Media-Bitrate", "X-Media-Resolution", "X-Media-Duration"];
 
 // *** CONFIGURATION ***
 log.level = config.LOG_LEVEL; // the minimum level of log messages to record: 0 = info, 1 = warn, 2 = error
@@ -446,15 +41,10 @@ http.createServer(function(req, res){
 
   log.message(log.DEBUG, "Initial request received");
 
-  // all responses include these headers to support cross-domain requests
-  var allowed_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"];
-  var allowed_headers = ["Accept", "Accept-Version", "Content-Type", "Api-Version", "Origin", "X-Requested-With","Range","X_FILENAME","X-Access-Key","X-Replacement-Access-Key","X-Access-Token", "X-Encrypted", "X-Private", "X-Append"];
-  var exposed_headers = ["X-Media-Type", "X-Media-Size", "X-Media-Channels", "X-Media-Bitrate", "X-Media-Resolution", "X-Media-Duration"];
-
-  res.setHeader("Access-Control-Allow-Methods", allowed_methods.join(","));
-  res.setHeader("Access-Control-Allow-Headers", allowed_headers.join(","));
+  res.setHeader("Access-Control-Allow-Methods", ALLOWED_METHODS.join(","));
+  res.setHeader("Access-Control-Allow-Headers", ALLOWED_HEADERS.join(","));
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Expose-Headers", exposed_headers.join(","));
+  res.setHeader("Access-Control-Expose-Headers", EXPOSED_HEADERS.join(","));
 
   // all requests are interrorgated for these values
   var target_url = require("url").parse(req.url).pathname;
@@ -476,40 +66,43 @@ http.createServer(function(req, res){
   }
 
   // check for request parameters, first in the header and then in the querystring
-  var access_token = url.parse(req.url,true).query.access_token || req.headers["x-access-token"];
-  var access_key = url.parse(req.url,true).query.access_key || req.headers["x-access-key"];
-  var replacement_access_key = url.parse(req.url,true).query.replacement_access_key || req.headers["x-replacement-access-key"];
-  var private = url.parse(req.url,true).query.private || req.headers["x-private"];
-  var encrypted = url.parse(req.url,true).query.encrypted || req.headers["x-encrypted"];
-  var expires = url.parse(req.url,true).query.expires || req.headers["x-expires"];
-  var content_type = url.parse(req.url,true).query.content_type || req.headers["content-type"];
-  var version = url.parse(req.url,true).query.version || req.headers["x-version"];
-  var inode_only = url.parse(req.url,true).query.inode_only || req.headers["x-inode-only"];
-  var block_only = url.parse(req.url,true).query.block_only || req.headers["x-block-only"];
+  var params = {
+    access_token           : url.parse(req.url,true).query.access_token || req.headers["x-access-token"],
+    access_key             : url.parse(req.url,true).query.access_key || req.headers["x-access-key"],
+    replacement_access_key : url.parse(req.url,true).query.replacement_access_key || req.headers["x-replacement-access-key"],
+    private                : url.parse(req.url,true).query.private || req.headers["x-private"],
+    encrypted              : url.parse(req.url,true).query.encrypted || req.headers["x-encrypted"],
+    expires                : url.parse(req.url,true).query.expires || req.headers["x-expires"],
+    content_type           : url.parse(req.url,true).query.content_type || req.headers["content-type"],
+    version                : url.parse(req.url,true).query.version || req.headers["x-version"],
+    inode_only             : url.parse(req.url,true).query.inode_only || req.headers["x-inode-only"],
+    block_only             : url.parse(req.url,true).query.block_only || req.headers["x-block-only"]
+  };
 
   log.message(log.INFO, "Received " + req.method + " request for URL " + target_url);
 
   // load requested inode
-  var inode = load_inode(target_url);
-
   switch(req.method){
 
     case "GET":
-      // return the first file located at the requested URL
-      if(inode){
-        requested_file = inode;
+      utils.load_inode(target_url, function(err, inode){
+        if (err) {
+          log.message(log.WARN, "Result: 404");
+          res.statusCode = 404;
+          return res.end();
+        }
+
+        var requested_file = inode;
 
         // check authorization
-        if(inode.private){
-          if((access_key && access_key === inode.access_key) ||
-            (access_token && token_valid(access_token, inode, req.method)) ||
-            (access_token && expires && time_token_valid(access_token, inode, expires, req.method))){
+        if (inode.private){
+          if (validate.is_authorized(inode, req.method, params)) {
             log.message(log.INFO, "GET request authorized");
           } else {
             log.message(log.WARN, "GET request unauthorized");
             res.statusCode = 401;
             res.end();
-            break;
+            return;
           }
         }
 
@@ -517,7 +110,7 @@ http.createServer(function(req, res){
           return options.encrypted ? crypto.createDecipher("aes-256-cbc", options.key) : through();
         };
 
-        var create_unzipper = function create_decryptor(compressed){
+        var create_unzipper = function create_unzipper(compressed){
           return compressed ? zlib.createGunzip() : through();
         };
 
@@ -531,32 +124,44 @@ http.createServer(function(req, res){
         var total_blocks = requested_file.blocks.length;
         var idx = 0;
 
-        var search_for_block = function search_for_block(){
-          for(var storage_location in config.STORAGE_LOCATIONS){
-            var selected_location = config.STORAGE_LOCATIONS[storage_location];
-            // check for compressed block first, then uncompressed
-            var search_path = selected_location.path + requested_file.blocks[idx].block_hash;
-            if(fs.existsSync(search_path + ".gz")){
-              log.message(log.INFO, "Found compressed block " + requested_file.blocks[idx].block_hash + ".gz in " + selected_location.path);
-              requested_file.blocks[idx].last_seen = selected_location.path;
-              save_inode(requested_file);
-              return read_file(search_path + ".gz", true);
-            } else if(fs.existsSync(search_path)){
-              log.message(log.INFO, "Found block " + requested_file.blocks[idx].block_hash + " in " + selected_location.path);
-              requested_file.blocks[idx].last_seen = selected_location.path;
-              save_inode(requested_file);
-              return read_file(search_path, false);
-            }
-          }
+        var search_for_block = function search_for_block(_idx){
+          var location = config.STORAGE_LOCATIONS[_idx];
+          var search_path = location.path + requested_file.blocks[idx].block_hash;
+          _idx++;
 
-          // we get here if we didn't find the block
-          log.message(log.ERROR, "Unable to locate block in any storage location");
-          res.statusCode = 500;
-          res.end("Unable to return file, missing blocks");
+          operations.exists(search_path + "gz", function(err, result){
+            if (result) {
+              log.message(log.INFO, "Found compressed block " + requested_file.blocks[idx].block_hash + ".gz in " + location.path);
+              requested_file.blocks[idx].last_seen = location.path;
+              utils.save_inode(requested_file, function(){
+                return read_file(search_path + ".gz", true);
+              });
+            } else {
+              operations.exists(search_path, function(_err, _result){
+                if (_result) {
+                  log.message(log.INFO, "Found block " + requested_file.blocks[idx].block_hash + " in " + location.path);
+                  requested_file.blocks[idx].last_seen = location.path;
+                  utils.save_inode(requested_file, function(){
+                    return read_file(search_path, false);
+                  });
+
+                } else {
+                  if (_idx === TOTAL_LOCATIONS) {
+                    // we get here if we didn't find the block
+                    log.message(log.ERROR, "Unable to locate block in any storage location");
+                    res.statusCode = 500;
+                    return res.end("Unable to return file, missing blocks");
+                  } else {
+                    return search_for_block(_idx);
+                  }
+                }
+              });
+            }
+          });
         };
 
         var read_file = function read_file(path, try_compressed){
-          var read_stream = fs.createReadStream(path);
+          var read_stream = operations.stream_read(path);
           var decryptor   = create_decryptor({ encrypted : requested_file.encrypted, key : requested_file.access_key});
           var unzipper    = create_unzipper(try_compressed);
           var should_end  = (idx + 1) === total_blocks;
@@ -567,7 +172,7 @@ http.createServer(function(req, res){
               return load_from_last_seen(false);
             } else {
               log.message(log.WARN, "Did not find block in expected location. Searching...");
-              return search_for_block();
+              return search_for_block(0);
             }
           }
 
@@ -600,175 +205,194 @@ http.createServer(function(req, res){
 
         var send_blocks = function send_blocks(){
 
-          if (idx === total_blocks) {
-            // we're done
+          if (idx === total_blocks) { // we're done
             return;
           } else {
             if (requested_file.blocks[idx].last_seen) {
               load_from_last_seen(true);
             } else {
-              search_for_block();
+              search_for_block(0);
             }
           }
         };
 
         send_blocks();
 
-      } else {
-        log.message(log.WARN, "Result: 404");
-        res.statusCode = 404;
-        res.end();
-      }
+      });
 
-    break;
+      break;
 
-  case "POST":
-  case "PUT":
-    // check if a file exists at this url
-    log.message(log.DEBUG, "Begin checking for existing file");
-    if(inode){
+    case "POST":
+    case "PUT":
+      // check if a file exists at this url
+      log.message(log.DEBUG, "Begin checking for existing file");
+      utils.load_inode(target_url, function(err, inode){
 
-      // check authorization
-      if((access_key && access_key === inode.access_key) ||
-        (access_token && token_valid(access_token, inode, req.method)) ||
-        (access_token && expires && time_token_valid(access_token, inode, expires, req.method))){
-        log.message(log.INFO, "File update request authorized");
-      } else {
-        log.message(log.WARN, "File update request unauthorized");
-        res.statusCode = 401;
-        res.end();
-        break;
-      }
-    } else {
-      log.message(log.DEBUG, "No existing file found, storing new file");
-    }
+        if (inode){
 
-    // store the posted data at the specified URL
-    var new_file = Object.create(Inode);
-    new_file.init(target_url);
-    log.message(log.DEBUG, "New file object created");
+          // check authorization
+          if (validate.is_authorized(inode, req.method, params)){
+            log.message(log.INFO, "File update request authorized");
+          } else {
+            log.message(log.WARN, "File update request unauthorized");
+            res.statusCode = 401;
+            res.end();
+            return;
+          }
+        } else {
+          log.message(log.DEBUG, "No existing file found, storing new file");
+        }
 
-    // set additional file properties (content-type, etc.)
-    if(content_type){
-      log.message(log.INFO, "Content-Type: " + content_type);
-      new_file.file_metadata.content_type = content_type;
-    }
-    if(private){
-      new_file.file_metadata.private = true;
-    }
-    if(encrypted){
-      new_file.file_metadata.encrypted = true;
-    }
+        // store the posted data at the specified URL
+        var new_file = Object.create(Inode);
+        new_file.init(target_url);
+        log.message(log.DEBUG, "New file object created");
 
-    // if access_key is supplied with update, replace the default one
-    if(access_key){
-      new_file.file_metadata.access_key = access_key;
-    }
-    log.message(log.INFO, "File properties set");
+        // set additional file properties (content-type, etc.)
+        if(params.content_type){
+          log.message(log.INFO, "Content-Type: " + params.content_type);
+          new_file.file_metadata.content_type = params.content_type;
+        }
+        if(params.private){
+          new_file.file_metadata.private = true;
+        }
+        if(params.encrypted){
+          new_file.file_metadata.encrypted = true;
+        }
 
-    req.on("data", function(chunk){
-      new_file.write(chunk, req, function(result){
-        if (!result) {
-          log.message(log.ERROR, "Error writing data to storage object");
-          res.statusCode = 500;
+        // if access_key is supplied with update, replace the default one
+        if(params.access_key){
+          new_file.file_metadata.access_key = params.access_key;
+        }
+        log.message(log.INFO, "File properties set");
+
+        req.on("data", function(chunk){
+          new_file.write(chunk, req, function(result){
+            if (!result) {
+              log.message(log.ERROR, "Error writing data to storage object");
+              res.statusCode = 500;
+              res.end();
+            }
+          });
+        });
+
+        req.on("end", function(){
+          log.message(log.INFO, "End of request");
+          if(new_file){
+            log.message(log.DEBUG, "Closing new file");
+            new_file.close(function(result){
+              if(result){
+                res.end(JSON.stringify(result));
+              } else {
+                log.message(log.ERROR, "Error closing storage object");
+                res.statusCode = 500;
+                res.end();
+              }
+            });
+          }
+        });
+
+
+      });
+
+      break;
+
+    case "DELETE":
+
+      // remove the data stored at the specified URL
+      utils.load_inode(target_url, function(error, inode){
+
+        if (error) {
+          log.message(log.WARN, "Error loading inode: " + error.toString());
+        }
+
+        if(inode){
+
+          // authorize (only keyholder can delete)
+          if(validate.has_key(inode, params)){
+
+            // delete inode file
+            log.message(log.INFO, "Delete request authorized");
+
+            var remove_inode = function remove_inode(idx){
+              var location = config.STORAGE_LOCATIONS[idx];
+              var file     = location.path + inode.fingerprint + ".json";
+
+              operations.delete(file, function(err){
+                idx++;
+                if (err) {
+                  log.message(log.WARN, "Inode " + inode.fingerprint + " doesn't exist in location " + location.path);
+                }
+
+                if (idx === TOTAL_LOCATIONS) {
+                  res.statusCode = 204;
+                  return res.end();
+                } else {
+                  remove_inode(idx);
+                }
+
+              });
+
+            };
+
+            remove_inode(0);
+
+          } else {
+            log.message(log.WARN, "Delete request unauthorized");
+            res.statusCode = 401;
+            res.end();
+          }
+        } else {
+          log.message(log.WARN, "Delete request file not found");
+          res.statusCode = 404;
           res.end();
         }
       });
-    });
 
-    req.on("end", function(){
-      log.message(log.INFO, "End of request");
-      if(new_file){
-        log.message(log.DEBUG, "Closing new file");
-        new_file.close(function(result){
-          if(result){
-            res.end(JSON.stringify(result));
-          } else {
-            log.message(log.ERROR, "Error closing storage object");
-            res.statusCode = 500;
-            res.end();
-          }
-        });
-      }
-    });
+      break;
 
-    break;
-
-  case "DELETE":
-
-    // remove the data stored at the specified URL
-    if(inode){
-
-      // authorize (only keyholder can delete)
-      if(inode.access_key === access_key){
-
-        // delete inode file
-        log.message(log.INFO, "Delete request authorized");
-
-        // remove inode from all configured storage locations
-        for(var storage_location in config.STORAGE_LOCATIONS){
-          var selected_location = config.STORAGE_LOCATIONS[storage_location];
-          try{
-            fs.unlinkSync(selected_location.path + inode.fingerprint + ".json");
-            log.message(log.DEBUG, "Inode " + inode.fingerprint + " removed from " + selected_location.path);
-          } catch(ex) {
-            log.message(log.WARN, "Inode " + inode.fingerprint + " doesn't exist in location " + selected_location.path);
-          }
+    case "HEAD":
+      utils.load_inode(target_url, function(error, requested_file){
+        if (error) {
+          log.message(log.WARN, "Error loading inode: " + error.toString());
         }
-        res.statusCode = 204;
-        res.end();
-      } else {
-        log.message(log.WARN, "Delete request unauthorized");
-        res.statusCode = 401;
-        res.end();
-      }
-    } else {
-      log.message(log.WARN, "Delete request file not found");
-      res.statusCode = 404;
-      res.end();
-    }
 
-    break;
+        if(requested_file){
 
-  case "HEAD":
-    var requested_file = load_inode(target_url);
-    if(requested_file){
+          // construct headers
+          res.setHeader("Content-Type", requested_file.content_type);
+          res.setHeader("Content-Length", requested_file.file_size);
 
-      // construct headers
-      res.setHeader("Content-Type", requested_file.content_type);
-      res.setHeader("Content-Length", requested_file.file_size);
-
-      // add extended object headers if we have them
-      if(requested_file.media_type){
-         res.setHeader("X-Media-Type", requested_file.media_type);
-        if(requested_file.media_type != "unknown"){
-          res.setHeader("X-Media-Size", requested_file.media_size);
-          res.setHeader("X-Media-Channels", requested_file.media_channels);
-          res.setHeader("X-Media-Bitrate", requested_file.media_bitrate);
-          res.setHeader("X-Media-Resolution", requested_file.media_resolution);
-          res.setHeader("X-Media-Duration", requested_file.media_duration);
+          // add extended object headers if we have them
+          if(requested_file.media_type){
+            res.setHeader("X-Media-Type", requested_file.media_type);
+            if(requested_file.media_type !== "unknown"){
+              res.setHeader("X-Media-Size", requested_file.media_size);
+              res.setHeader("X-Media-Channels", requested_file.media_channels);
+              res.setHeader("X-Media-Bitrate", requested_file.media_bitrate);
+              res.setHeader("X-Media-Resolution", requested_file.media_resolution);
+              res.setHeader("X-Media-Duration", requested_file.media_duration);
+            }
+          }
+          return res.end();
+        } else {
+          log.message(log.INFO, "HEAD Result: 404");
+          res.statusCode = 404;
+          return res.end();
         }
-      }
+      });
+
+      break;
+
+    case "OPTIONS":
+      // support for OPTIONS is required to support cross-domain requests (CORS)
+      res.writeHead(204);
       res.end();
-    } else {
-      log.message(log.INFO, "Result: 404");
-      res.statusCode = 404;
-      res.end();
-    }
+      break;
 
-    break;
-
-   case "OPTIONS":
-
-    // support for OPTIONS is required to support cross-domain requests (CORS)
-    res.writeHead(204);
-    res.end();
-
-    break;
-
-  default:
-    res.writeHead(405);
-    res.end("method " + req.method + " is not supported");
-}
+    default:
+      res.writeHead(405);
+      res.end("method " + req.method + " is not supported");
+  }
 
 }).listen(config.SERVER_PORT);
