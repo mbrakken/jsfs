@@ -10,10 +10,10 @@
 var http       = require("http");
 var crypto     = require("crypto");
 var zlib       = require("zlib");
-var url        = require("url");
 var through    = require("through");
 var config     = require("./config.js");
 var log        = require("./jlog.js");
+var static     = require("./lib/static.js");
 var utils      = require("./lib/utils.js");
 var validate   = require("./lib/validate.js");
 var operations = require("./lib/" + (config.CONFIGURED_STORAGE || "fs") + "/disk-operations.js");
@@ -25,9 +25,10 @@ var Inode = require("./lib/inode.js");
 var TOTAL_LOCATIONS = config.STORAGE_LOCATIONS.length;
 
 // all responses include these headers to support cross-domain requests
-var ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS"];
-var ALLOWED_HEADERS = ["Accept", "Accept-Version", "Content-Type", "Api-Version", "Origin", "X-Requested-With","Range","X_FILENAME","X-Access-Key","X-Replacement-Access-Key","X-Access-Token", "X-Encrypted", "X-Private", "X-Append"];
-var EXPOSED_HEADERS = ["X-Media-Type", "X-Media-Size", "X-Media-Channels", "X-Media-Bitrate", "X-Media-Resolution", "X-Media-Duration"];
+var ALLOWED_METHODS = static.ALLOWED_METHODS.join(",");
+var ALLOWED_HEADERS = static.ALLOWED_HEADERS.join(",");
+var EXPOSED_HEADERS = static.EXPOSED_HEADERS.join(",");
+var ACCEPTED_PARAMS = static.ACCEPTED_PARAMS;
 
 // *** CONFIGURATION ***
 log.level = config.LOG_LEVEL; // the minimum level of log messages to record: 0 = info, 1 = warn, 2 = error
@@ -41,43 +42,18 @@ http.createServer(function(req, res){
 
   log.message(log.DEBUG, "Initial request received");
 
-  res.setHeader("Access-Control-Allow-Methods", ALLOWED_METHODS.join(","));
-  res.setHeader("Access-Control-Allow-Headers", ALLOWED_HEADERS.join(","));
+  res.setHeader("Access-Control-Allow-Methods", ALLOWED_METHODS;
+  res.setHeader("Access-Control-Allow-Headers", ALLOWED_HEADERS;
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Expose-Headers", EXPOSED_HEADERS.join(","));
+  res.setHeader("Access-Control-Expose-Headers", EXPOSED_HEADERS;
 
   // all requests are interrorgated for these values
-  var target_url = require("url").parse(req.url).pathname;
-
-  // host-based url shortcut expansion
-  if(target_url.substring(0,2) != "/."){
-    var host_string = req.headers.host;
-    if(host_string){
-      var host_string_parts = host_string.split(":");
-      var forward_host = host_string_parts[0].split(".");
-      var reversed_host = "";
-      for(var i=(forward_host.length - 1);i>=0;i--){
-        reversed_host = reversed_host + "." + forward_host[i];
-      }
-      target_url = "/" + reversed_host.substring(1) + target_url;
-    }
-  } else {
-    target_url = "/" + target_url.substring(2);
-  }
+  var target_url = utils.target_from_url(req.url);
 
   // check for request parameters, first in the header and then in the querystring
-  var params = {
-    access_token           : url.parse(req.url,true).query.access_token || req.headers["x-access-token"],
-    access_key             : url.parse(req.url,true).query.access_key || req.headers["x-access-key"],
-    replacement_access_key : url.parse(req.url,true).query.replacement_access_key || req.headers["x-replacement-access-key"],
-    private                : url.parse(req.url,true).query.private || req.headers["x-private"],
-    encrypted              : url.parse(req.url,true).query.encrypted || req.headers["x-encrypted"],
-    expires                : url.parse(req.url,true).query.expires || req.headers["x-expires"],
-    content_type           : url.parse(req.url,true).query.content_type || req.headers["content-type"],
-    version                : url.parse(req.url,true).query.version || req.headers["x-version"],
-    inode_only             : url.parse(req.url,true).query.inode_only || req.headers["x-inode-only"],
-    block_only             : url.parse(req.url,true).query.block_only || req.headers["x-block-only"]
-  };
+  // Moved these to an object to avoid possible issues from "private" being a reserved word
+  // (for future use) and to avoid jslint errors from unimplemented param handlers.
+  var params = utils.request_parameters(ACCEPTED_PARAMS, req.url, req.headers);
 
   log.message(log.INFO, "Received " + req.method + " request for URL " + target_url);
 
@@ -101,8 +77,7 @@ http.createServer(function(req, res){
           } else {
             log.message(log.WARN, "GET request unauthorized");
             res.statusCode = 401;
-            res.end();
-            return;
+            return res.end();
           }
         }
 
@@ -291,7 +266,6 @@ http.createServer(function(req, res){
             });
           }
         });
-
 
       });
 
