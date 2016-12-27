@@ -3,11 +3,14 @@ var mock       = require('mock-fs');
 var expect     = require('chai').expect
 var utils      = require("../lib/utils.js");
 var file_types = require("../lib/file-types.js");
+var static     = require("../lib/static.js");
 var config     = require("../config.js");
 var log        = require("../jlog.js");
 
 var DEFAULT_STORAGE = config.STORAGE_LOCATIONS;
 var BLOCK_SIZE = config.BLOCK_SIZE;
+var TEST_PATH = "/com.jsfs.test/path/to/file.json";
+var ACCEPTED_PARAMS = static.ACCEPTED_PARAMS;
 
 function load_test_block(file, callback) {
   fs.readFile(file, function(err, data){
@@ -100,7 +103,7 @@ describe("utils.js", function() {
 
     describe("#load_inode(url, callback)", function() {
 
-      it("finds an inode", function(done) {
+      it("should find an inode", function(done) {
         utils.load_inode("test_inode_1", function(err, inode){
           if (err) {
             done(err);
@@ -110,7 +113,7 @@ describe("utils.js", function() {
         });
       });
 
-      it("searches multiple directories and returns found inode", function(done) {
+      it("should searche multiple directories and return found inode", function(done) {
         utils.load_inode("test_inode_2", function(err, inode){
           if (err) {
             done(err);
@@ -120,7 +123,7 @@ describe("utils.js", function() {
         });
       });
 
-      it("returns an error for missing inode", function(done) {
+      it("should return an error for missing inode", function(done) {
         utils.load_inode("test_inode_3", function(err, inode){
           expect(inode).to.be.undefined;
           expect(err).to.be.an.instanceof(Error);
@@ -134,7 +137,7 @@ describe("utils.js", function() {
 
     describe("#save_inode(inode, callback)", function(){
 
-      it("saves an inode", function(done) {
+      it("should save an inode", function(done) {
         var path  = "test_inode_4";
         var inode = { fingerprint: utils.sha1_to_hex(path) };
 
@@ -150,6 +153,83 @@ describe("utils.js", function() {
           });
         });
       });
+    });
+
+  });
+
+  describe("#target_from_url(uri)", function() {
+
+    it("should set target from url", function() {
+      var test_uri = "http://test.jsfs.com/path/to/file.json";
+      var result   = utils.target_from_url(test_uri);
+
+      expect(result).to.be.a("string");
+      expect(result).to.equal(TEST_PATH);
+    });
+
+    it("should return fully specificed target path", function() {
+      var test_uri = "http://test2.jsfs.com/.com.jsfs.test/path/to/file.json";
+      var result   = utils.target_from_url(test_uri);
+
+      expect(result).to.be.a("string");
+      expect(result).to.equal(TEST_PATH);
+    });
+
+    it("should ignore the port", function() {
+      var test_uri = "http://test.jsfs.com:1234/path/to/file.json";
+      var result   = utils.target_from_url(test_uri);
+
+      expect(result).to.be.a("string");
+      expect(result).to.equal(TEST_PATH);
+    });
+
+    it("should ignore query params", function() {
+      var test_uri = "http://test.jsfs.com/path/to/file.json?test=query&more=fun";
+      var result   = utils.target_from_url(test_uri);
+
+      expect(result).to.be.a("string");
+      expect(result).to.equal(TEST_PATH);
+    });
+
+  });
+
+  describe("#request_parameters", function() {
+
+    it("should return object with all parameters", function() {
+      var test_uri = "http://test.jsfs.com/path/to/file.json";
+      var headers = {};
+      var result = utils.request_parameters(ACCEPTED_PARAMS, test_uri, headers);
+
+      expect(result).to.be.an("object");
+      expect(Object.keys(result)).to.have.lengthOf(ACCEPTED_PARAMS.length);
+      expect(result).to.have.all.keys(ACCEPTED_PARAMS);
+    });
+
+    it("should set parameters from query", function() {
+      var test_uri = "http://test.jsfs.com/path/to/file.json?access_token=testing";
+      var headers = {};
+      var result = utils.request_parameters(ACCEPTED_PARAMS, test_uri, headers);
+
+      expect(result).to.be.an("object");
+      expect(result.access_token).to.equal("testing");
+    });
+
+    it("should set parameters from header", function() {
+      var test_uri = "http://test.jsfs.com/path/to/file.json";
+      var headers = {"x-access-token": "testing"};
+      var result = utils.request_parameters(ACCEPTED_PARAMS, test_uri, headers);
+
+      expect(result).to.be.an("object");
+      expect(result.access_token).to.equal("testing");
+    });
+
+    it("should give priority to url query over header", function() {
+      var test_uri = "http://test.jsfs.com/path/to/file.json?access_token=testing";
+      var headers = {"x-access-token": "ignore_me"};
+      var result = utils.request_parameters(ACCEPTED_PARAMS, test_uri, headers);
+
+      expect(result).to.be.an("object");
+      expect(result.access_token).to.equal("testing");
     });
 
   });
