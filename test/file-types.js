@@ -6,20 +6,18 @@ var config     = require("../config.js");
 var BLOCK_SIZE = config.BLOCK_SIZE;
 
 var WAVE_RESULT = {
-  bitrate: 44100,
-  channels: 2,
-  data_block_size: 4,
-  duration: 302.26666666666665,
-  resolution: 16,
-  size: 53319876,
-  subchunk_byte: 36,
-  subchunk_id: "data",
-  type: "wave"
+  bitrate         : 44100,
+  channels        : 2,
+  data_block_size : 4,
+  duration        : 302.26666666666665,
+  resolution      : 16,
+  size            : 53319876,
+  subchunk_byte   : 36,
+  subchunk_id     : "data",
+  type            : "wave"
 };
 
-var UNKNOWN_RESULT = {
-  type: "unknown"
-};
+var UNKNOWN_RESULT = { type: "unknown" };
 
 function load_test_block(file, callback) {
   fs.readFile(file, function(err, data){
@@ -49,7 +47,7 @@ describe("file-types.js", function() {
       });
     });
 
-    it("should return `{ type: \"unknown\" }` for anything not wave", function(done) {
+    it("should return `{ type: \"unknown\" }` for mp3 (anything not wave)", function(done) {
       load_test_block("./test/fixtures/test.mp3", function(error, block){
         if (error) {
           done(error);
